@@ -2,15 +2,26 @@
 //! target kache is being built for. `src/build_script.rs` embeds the binary and
 //! installs a copy wherever Cargo expects a build script it caches.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "launcher/personality.rs"]
+mod personality;
+
 const SOURCE: &str = "launcher/build_script.rs";
+/// The helper that reads the personality names out of the toolchain.
+const PERSONALITY: &str = "launcher/personality.rs";
+/// The environment variable that points the launcher at the personality
+/// exports derived from the toolchain.
+const PERSONALITY_ENV: &str = "KACHE_LAUNCHER_PERSONALITY_FILE";
+/// The cfg that tells the launcher to include those exports.
+const PERSONALITY_CFG: &str = "kache_personality_export";
 
 fn main() {
     println!("cargo:rerun-if-changed={SOURCE}");
-    let out =
-        PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR")).join("build-script-launcher");
+    println!("cargo:rerun-if-changed={PERSONALITY}");
+    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+    let out = out_dir.join("build-script-launcher");
     // Launchers are installed on Unix only; elsewhere nothing reads the bytes.
     if std::env::var_os("CARGO_CFG_UNIX").is_none() {
         std::fs::write(&out, b"").expect("writing the empty launcher");
@@ -19,7 +30,7 @@ fn main() {
 
     let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
     let target = std::env::var("TARGET").expect("TARGET");
-    let mut command = Command::new(rustc);
+    let mut command = Command::new(&rustc);
     command
         .args(["--edition", "2024", "--crate-type", "bin"])
         .args(["--crate-name", "kache_build_script_launcher"])
@@ -34,8 +45,22 @@ fn main() {
         ])
         .args(["-C", "debuginfo=0", "-C", "strip=symbols"])
         .arg("-o")
-        .arg(&out)
-        .arg(SOURCE);
+        .arg(&out);
+    // The precompiled `core` names the exception personality in its unwind
+    // tables, and the name depends on the compiler version. Derive it from
+    // the toolchain and hand it to the launcher, which cannot spell it out.
+    let exports = personality_exports(Path::new(&rustc), &target);
+    if !exports.is_empty() {
+        let file = out_dir.join("personality.rs");
+        std::fs::write(&file, exports).expect("writing the personality exports");
+        command
+            .env(PERSONALITY_ENV, &file)
+            .arg("--cfg")
+            .arg(PERSONALITY_CFG)
+            .arg("--check-cfg")
+            .arg(format!("cfg({PERSONALITY_CFG})"));
+    }
+    command.arg(SOURCE);
     // Link the launcher the way Cargo links kache for this target.
     if let Some(linker) = std::env::var_os("RUSTC_LINKER") {
         let mut flag = std::ffi::OsString::from("linker=");
@@ -68,6 +93,21 @@ fn main() {
 fn target_is_glibc() -> bool {
     let cfg = |name: &str| std::env::var(name).unwrap_or_default();
     cfg("CARGO_CFG_TARGET_OS") == "linux" && cfg("CARGO_CFG_TARGET_ENV") == "gnu"
+}
+
+/// The Rust source that defines the exception personality under the names the
+/// toolchain's `core` asks for.
+///
+/// A toolchain without a precompiled `core` has no unwind tables to read the
+/// names out of, and asks for no personality either.
+fn personality_exports(rustc: &Path, target: &str) -> String {
+    let Some(image) = personality::core_image(rustc, Some(target)) else {
+        return String::new();
+    };
+    let Ok(bytes) = std::fs::read(&image) else {
+        return String::new();
+    };
+    personality::source(&personality::names_in(&bytes))
 }
 
 /// The `-C` options from the target's rustflags that decide how a binary
